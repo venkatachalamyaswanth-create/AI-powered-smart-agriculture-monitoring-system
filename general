@@ -1,0 +1,136 @@
+1. generate_dataset.py — creates the sensor dataset
+
+import numpy as np
+import pandas as pd
+
+np.random.seed(42)
+N_SAMPLES = 1200
+
+def generate():
+    N = np.random.normal(80, 20, N_SAMPLES).clip(0, 150)
+    P = np.random.normal(45, 15, N_SAMPLES).clip(0, 100)
+    K = np.random.normal(50, 18, N_SAMPLES).clip(0, 120)
+    pH = np.random.normal(6.5, 0.8, N_SAMPLES).clip(4.0, 9.0)
+    soil_moisture = np.random.normal(35, 12, N_SAMPLES).clip(5, 80)
+    temperature = np.random.normal(27, 5, N_SAMPLES).clip(10, 45)
+    humidity = np.random.normal(65, 15, N_SAMPLES).clip(20, 100)
+    rainfall = np.random.exponential(80, N_SAMPLES).clip(0, 400)
+
+    npk_score = 1 - (np.abs(N - 90) / 150 + np.abs(P - 50) / 100 + np.abs(K - 60) / 120) / 3
+    ph_score = 1 - np.abs(pH - 6.5) / 2.5
+    moisture_score = 1 - np.abs(soil_moisture - 40) / 40
+    temp_score = 1 - np.abs(temperature - 25) / 20
+    rain_score = 1 - np.abs(rainfall - 100) / 300
+
+    composite = (0.30*npk_score + 0.20*ph_score + 0.25*moisture_score +
+                 0.15*temp_score + 0.10*rain_score).clip(0, 1)
+    composite = (composite + np.random.normal(0, 0.08, N_SAMPLES)).clip(0, 1)
+
+    yield_kg_per_ha = (composite * 4500 + 500).round(1)
+    health_status = pd.cut(composite, bins=[-0.01, 0.62, 0.75, 1.01],
+                            labels=["Poor", "Stressed", "Healthy"])
+
+    return pd.DataFrame({
+        "N": N.round(1), "P": P.round(1), "K": K.round(1), "pH": pH.round(2),
+        "soil_moisture": soil_moisture.round(1), "temperature": temperature.round(1),
+        "humidity": humidity.round(1), "rainfall": rainfall.round(1),
+        "yield_kg_per_ha": yield_kg_per_ha, "health_status": health_status.astype(str)
+    })
+
+if __name__ == "__main__":
+    df = generate()
+    df.to_csv("sensor_dataset.csv", index=False)
+    print(df.head())
+
+2. train_model.py — trains and evaluates both models
+
+import joblib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.metrics import (mean_squared_error, r2_score, mean_absolute_error,
+                              accuracy_score, f1_score, classification_report,
+                              confusion_matrix)
+
+FEATURES = ["N", "P", "K", "pH", "soil_moisture", "temperature", "humidity", "rainfall"]
+
+def run_regression(df):
+    X, y = df[FEATURES], df["yield_kg_per_ha"]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    scaler = StandardScaler()
+    X_train_s, X_test_s = scaler.fit_transform(X_train), scaler.transform(X_test)
+
+    model = RandomForestRegressor(n_estimators=300, max_depth=10, random_state=42)
+    model.fit(X_train_s, y_train)
+    preds = model.predict(X_test_s)
+
+    print("RMSE:", np.sqrt(mean_squared_error(y_test, preds)))
+    print("MAE:", mean_absolute_error(y_test, preds))
+    print("R2:", r2_score(y_test, preds))
+
+    joblib.dump(model, "yield_regressor.pkl")
+    joblib.dump(scaler, "yield_scaler.pkl")
+    return model, scaler
+
+def run_classification(df):
+    X = df[FEATURES]
+    le = LabelEncoder()
+    y = le.fit_transform(df["health_status"])
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y)
+
+    scaler = StandardScaler()
+    X_train_s, X_test_s = scaler.fit_transform(X_train), scaler.transform(X_test)
+
+    model = RandomForestClassifier(n_estimators=300, max_depth=10,
+                                    random_state=42, class_weight="balanced")
+    model.fit(X_train_s, y_train)
+    preds = model.predict(X_test_s)
+
+    print("Accuracy:", accuracy_score(y_test, preds))
+    print("F1:", f1_score(y_test, preds, average="weighted"))
+    print(classification_report(y_test, preds, target_names=le.classes_))
+
+    cm = confusion_matrix(y_test, preds)
+    sns.heatmap(cm, annot=True, fmt="d", xticklabels=le.classes_, yticklabels=le.classes_)
+    plt.savefig("confusion_matrix.png")
+
+    joblib.dump(model, "health_classifier.pkl")
+    joblib.dump(scaler, "health_scaler.pkl")
+    joblib.dump(le, "health_label_encoder.pkl")
+
+if __name__ == "__main__":
+    df = pd.read_csv("sensor_dataset.csv")
+    run_regression(df)
+    run_classification(df)
+
+3. predict_sample.py — inference on new sensor readings
+
+import joblib
+import pandas as pd
+
+FEATURES = ["N", "P", "K", "pH", "soil_moisture", "temperature", "humidity", "rainfall"]
+
+yield_model = joblib.load("yield_regressor.pkl")
+yield_scaler = joblib.load("yield_scaler.pkl")
+health_model = joblib.load("health_classifier.pkl")
+health_scaler = joblib.load("health_scaler.pkl")
+label_encoder = joblib.load("health_label_encoder.pkl")
+
+new_reading = pd.DataFrame([{
+    "N": 88, "P": 48, "K": 58, "pH": 6.4, "soil_moisture": 38,
+    "temperature": 26, "humidity": 60, "rainfall": 95
+}], columns=FEATURES)
+
+yield_pred = yield_model.predict(yield_scaler.transform(new_reading))
+health_pred = label_encoder.inverse_transform(
+    health_model.predict(health_scaler.transform(new_reading)))
+
+print(f"Predicted Yield: {yield_pred[0]:.1f} kg/ha")
+print(f"Predicted Health Status: {health_pred[0]}")
